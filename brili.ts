@@ -349,6 +349,18 @@ type State = {
 
   // For speculation: the state at the point where speculation began.
   specparent: State | null;
+
+  // For tracing: whether we are currently recording a trace.
+  tracing: boolean;
+
+  // Collected instructions in the current trace.
+  traceInstrs: bril.Instruction[];
+
+  // Maximum number of instructions to record in a trace.
+  traceLimit: number;
+
+  // Index in main where tracing stopped (due to side effects or backedge).
+  traceStopIndex: number | null;
 };
 
 /**
@@ -394,6 +406,9 @@ function evalCall(instr: bril.Operation, state: State): Action {
     icount: state.icount,
     ssaEnv: new Map(),
     specparent: null, // Speculation not allowed.
+    tracing: false,
+    traceInstrs: [],
+    traceLimit: 0,
   };
   const retVal = evalFunc(func, newState);
   state.icount = newState.icount;
@@ -830,11 +845,75 @@ function evalInstr(instr: bril.Instruction, state: State): Action {
 }
 
 function evalFunc(func: bril.Function, state: State): Value | null {
+  // Precompute label positions to help detect backedges when tracing.
+  const labelPos: Map<bril.Ident, number> = new Map();
+  for (let i = 0; i < func.instrs.length; ++i) {
+    const line = func.instrs[i];
+    if ("label" in line) {
+      labelPos.set(line.label, i);
+    }
+  }
+
+  // Start tracing at the beginning of main, if tracing is enabled.
+  if (func.name === "main" && state.traceLimit > 0 && !state.tracing) {
+    state.tracing = true;
+    state.traceStopIndex = null;
+  }
+
   for (let i = 0; i < func.instrs.length; ++i) {
     const line = func.instrs[i];
     if ("op" in line) {
       // Run an instruction.
       const action = evalInstr(line, state);
+
+      // Record the instruction in the trace, if tracing is enabled.
+      if (state.tracing && state.traceInstrs.length < state.traceLimit) {
+        // Instructions that have potential side effects end the trace.
+        const stopOps = new Set<bril.OpCode>([
+          "print",
+          "call",
+          "alloc",
+          "free",
+          "store",
+          "load",
+          "ptradd",
+          "speculate",
+          "commit",
+        ]);
+
+        if (stopOps.has(line.op)) {
+          // Do not record this instruction; just end the trace here.
+          state.tracing = false;
+          if (func.name === "main" && state.traceStopIndex === null) {
+            state.traceStopIndex = i;
+          }
+        } else if (line.op === "br") {
+          // Replace branches with guards that check the condition and
+          // deoptimize if the condition is false.
+          const condVar = (line.args || [])[0];
+          if (condVar === undefined) {
+            throw error("br without condition while tracing");
+          }
+          const guardInstr: bril.Instruction = {
+            op: "guard",
+            args: [condVar],
+            labels: ["__trace_abort"],
+          };
+          state.traceInstrs.push(guardInstr);
+        } else if (line.op === "jmp") {
+          // Do not include jumps in the linear trace.
+        } else {
+          // Copy other instructions as-is.
+          state.traceInstrs.push(line);
+        }
+
+        if (state.traceInstrs.length >= state.traceLimit) {
+          state.tracing = false;
+          if (func.name === "main" && state.traceStopIndex === null) {
+            state.traceStopIndex = i + 1;
+          }
+        }
+      }
 
       // Take the prescribed action.
       switch (action.action) {
@@ -889,6 +968,18 @@ function evalFunc(func: bril.Function, state: State): Value | null {
         }
         if (i === func.instrs.length) {
           throw error(`label ${action.label} not found`);
+        }
+      }
+
+      // Backedges terminate tracing.
+      if (state.tracing && action.action === "jump") {
+        const target = action.label;
+        const pos = labelPos.get(target);
+        if (pos !== undefined && pos <= i) {
+          state.tracing = false;
+          if (func.name === "main" && state.traceStopIndex === null) {
+            state.traceStopIndex = i + 1;
+          }
         }
       }
     }
@@ -983,10 +1074,21 @@ function evalProg(prog: bril.Program) {
   // Silly argument parsing to find the `-p` flag.
   const args: string[] = Array.from(Deno.args);
   let profiling = false;
+  let traceOut: string | null = null;
   const pidx = args.indexOf("-p");
   if (pidx > -1) {
     profiling = true;
     args.splice(pidx, 1);
+  }
+
+  // Find a trace output flag of the form --trace-out=FILE.
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--trace-out=")) {
+      traceOut = a.substring("--trace-out=".length);
+      args.splice(i, 1);
+      break;
+    }
   }
 
   // Remaining arguments are for the main function.k
@@ -1000,6 +1102,12 @@ function evalProg(prog: bril.Program) {
     icount: BigInt(0),
     ssaEnv: new Map(),
     specparent: null,
+    tracing: false,
+    traceInstrs: [],
+    // Only trace when an output file was requested; otherwise, leave
+    // the limit at 0 so tracing stays fully disabled.
+    traceLimit: traceOut ? 200 : 0,
+    traceStopIndex: null,
   };
   evalFunc(main, state);
 
@@ -1011,6 +1119,35 @@ function evalProg(prog: bril.Program) {
 
   if (profiling) {
     console.error(`total_dyn_inst: ${state.icount}`);
+  }
+
+  // Always emit a trace file if requested, even if no instructions were recorded.
+  if (traceOut) {
+    // Default stop index to 0 if we never set one (e.g., empty function).
+    const stopIndex = state.traceStopIndex === null ? 0 : state.traceStopIndex;
+
+    const metaFunc: bril.Function = {
+      name: "__trace_meta_main",
+      args: [],
+      instrs: [
+        {
+          op: "const",
+          dest: "__trace_stop_index",
+          type: "int",
+          value: stopIndex,
+        } as unknown as bril.Instruction,
+      ],
+    };
+
+    const traceFunc: bril.Function = {
+      name: "__trace_main",
+      args: main.args || [],
+      instrs: state.traceInstrs, // May be empty.
+    };
+    const outProg: bril.Program = {
+      functions: [...prog.functions, traceFunc, metaFunc],
+    };
+    Deno.writeTextFileSync(traceOut, JSON.stringify(outProg, null, 2));
   }
 }
 
